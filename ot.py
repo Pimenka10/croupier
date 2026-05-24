@@ -1,224 +1,202 @@
 import asyncio
-import sqlite3
 import logging
+import asyncpg
 from datetime import datetime, timedelta
 from decimal import Decimal
 from os import getenv
+from zoneinfo import ZoneInfo  # для часового пояса
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
 load_dotenv()
-BOT_TOKEN = getenv("BOT_TOKEN")
+TELEGRAM_TOKEN = getenv("TELEGRAM_TOKEN")
 ADMIN_PASSWORD = getenv("ADMIN_PASSWORD")
+DATABASE_URL = getenv("DATABASE_URL")
 
-if not BOT_TOKEN:
-    raise ValueError("Не задан BOT_TOKEN в .env")
+if not TELEGRAM_TOKEN or not DATABASE_URL:
+    raise ValueError("Не заданы TELEGRAM_TOKEN или DATABASE_URL")
 
-# Настройка логов
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=TELEGRAM_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ---------- База данных ----------
-DB_NAME = "croupier_bot.db"
+# Глобальный пул соединений с БД
+db_pool = None
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    # Таблица крупье
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS croupiers (
-            tg_id INTEGER PRIMARY KEY,
-            first_name TEXT NOT NULL,
-            last_name TEXT NOT NULL,
-            city TEXT NOT NULL,
-            level INTEGER NOT NULL CHECK(level BETWEEN 1 AND 5),
-            hourly_rate INTEGER NOT NULL,
-            tg_username TEXT
-        )
-    ''')
-    # Таблица смен
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS shifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            croupier_tg_id INTEGER NOT NULL,
-            start_time TEXT NOT NULL,
-            end_time TEXT,
-            hours_worked REAL,
-            salary REAL,
-            status TEXT DEFAULT 'active',
-            FOREIGN KEY(croupier_tg_id) REFERENCES croupiers(tg_id)
-        )
-    ''')
-    # Таблица менеджеров (турнирные менеджеры)
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS managers (
-            tg_id INTEGER PRIMARY KEY,
-            city TEXT NOT NULL,
-            role TEXT DEFAULT 'tournament_manager'
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# Часовой пояс Барнаул (UTC+7)
+TZ = ZoneInfo("Asia/Barnaul")
 
-init_db()
+def now_local():
+    """Возвращает текущее время в Барнауле"""
+    return datetime.now(TZ)
 
-# Вспомогательные функции для БД
-def get_croupier(tg_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT tg_id, first_name, last_name, city, level, hourly_rate, tg_username FROM croupiers WHERE tg_id = ?", (tg_id,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return {"tg_id": row[0], "first_name": row[1], "last_name": row[2], "city": row[3],
-                "level": row[4], "hourly_rate": row[5], "tg_username": row[6]}
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    # Таблицы уже есть, но для надёжности проверим
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS croupiers (
+                tg_id BIGINT PRIMARY KEY,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                city TEXT NOT NULL,
+                level INTEGER NOT NULL CHECK (level BETWEEN 1 AND 5),
+                hourly_rate INTEGER NOT NULL,
+                tg_username TEXT
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS shifts (
+                id SERIAL PRIMARY KEY,
+                croupier_tg_id BIGINT REFERENCES croupiers(tg_id) ON DELETE CASCADE,
+                start_time TIMESTAMP NOT NULL,
+                end_time TIMESTAMP,
+                hours_worked REAL,
+                salary REAL,
+                status TEXT DEFAULT 'active'
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS managers (
+                tg_id BIGINT PRIMARY KEY,
+                city TEXT NOT NULL,
+                role TEXT DEFAULT 'tournament_manager'
+            )
+        ''')
+
+# ---------- Функции работы с БД (асинхронные) ----------
+
+async def get_croupier(tg_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT tg_id, first_name, last_name, city, level, hourly_rate, tg_username FROM croupiers WHERE tg_id = $1",
+            tg_id
+        )
+        if row:
+            return dict(row)
     return None
 
-def get_all_croupiers():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT tg_id, first_name, last_name, city, level, hourly_rate, tg_username FROM croupiers ORDER BY city, last_name")
-    rows = cur.fetchall()
-    conn.close()
-    return [{"tg_id": r[0], "first_name": r[1], "last_name": r[2], "city": r[3],
-             "level": r[4], "hourly_rate": r[5], "tg_username": r[6]} for r in rows]
+async def get_all_croupiers():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT tg_id, first_name, last_name, city, level, hourly_rate, tg_username FROM croupiers ORDER BY city, last_name")
+        return [dict(r) for r in rows]
 
-def add_croupier(tg_id, first_name, last_name, city, level, hourly_rate, tg_username=None):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    try:
-        cur.execute('''
-            INSERT INTO croupiers (tg_id, first_name, last_name, city, level, hourly_rate, tg_username)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (tg_id, first_name, last_name, city, level, hourly_rate, tg_username))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
+async def add_croupier(tg_id, first_name, last_name, city, level, hourly_rate, tg_username=None):
+    async with db_pool.acquire() as conn:
+        try:
+            await conn.execute('''
+                INSERT INTO croupiers (tg_id, first_name, last_name, city, level, hourly_rate, tg_username)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ''', tg_id, first_name, last_name, city, level, hourly_rate, tg_username)
+            return True
+        except asyncpg.UniqueViolationError:
+            return False
 
-def delete_croupier(tg_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM croupiers WHERE tg_id = ?", (tg_id,))
-    # Также можно удалить или пометить смены – для простоты оставим
-    conn.commit()
-    conn.close()
+async def delete_croupier(tg_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM croupiers WHERE tg_id = $1", tg_id)
 
-def get_active_shift(croupier_tg_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT id, start_time, status FROM shifts WHERE croupier_tg_id = ? AND status = 'active'", (croupier_tg_id,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return {"id": row[0], "start_time": row[1], "status": row[2]}
+async def get_active_shift(croupier_tg_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, start_time, status FROM shifts WHERE croupier_tg_id = $1 AND status = 'active'",
+            croupier_tg_id
+        )
+        if row:
+            return {"id": row["id"], "start_time": row["start_time"], "status": row["status"]}
     return None
 
-def start_shift(croupier_tg_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    now = datetime.now().isoformat()
-    cur.execute("INSERT INTO shifts (croupier_tg_id, start_time, status) VALUES (?, ?, 'active')",
-                (croupier_tg_id, now))
-    shift_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return shift_id, now
+async def start_shift(croupier_tg_id: int):
+    async with db_pool.acquire() as conn:
+        now = now_local()
+        row = await conn.fetchrow(
+            "INSERT INTO shifts (croupier_tg_id, start_time, status) VALUES ($1, $2, 'active') RETURNING id",
+            croupier_tg_id, now
+        )
+        shift_id = row["id"]
+        return shift_id, now
 
-def close_shift(croupier_tg_id: int, hourly_rate: float):
-    active = get_active_shift(croupier_tg_id)
+async def close_shift(croupier_tg_id: int, hourly_rate: float):
+    active = await get_active_shift(croupier_tg_id)
     if not active:
         return None
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    end_time = datetime.now()
-    start_time = datetime.fromisoformat(active["start_time"])
+    end_time = now_local()
+    start_time = active["start_time"]
+    # start_time уже имеет часовой пояс, так как мы сохранили как timestamp with time zone
     hours_worked = (end_time - start_time).total_seconds() / 3600.0
     salary = Decimal(str(hours_worked)) * Decimal(str(hourly_rate))
     salary = round(salary, 2)
-    cur.execute('''
-        UPDATE shifts
-        SET end_time = ?, hours_worked = ?, salary = ?, status = 'closed'
-        WHERE id = ?
-    ''', (end_time.isoformat(), hours_worked, float(salary), active["id"]))
-    conn.commit()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            UPDATE shifts
+            SET end_time = $1, hours_worked = $2, salary = $3, status = 'closed'
+            WHERE id = $4
+        ''', end_time, hours_worked, float(salary), active["id"])
     return hours_worked, float(salary), start_time, end_time
 
-def get_shifts_for_manager(city: str = None, limit=50):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    if city:
-        cur.execute('''
-            SELECT s.id, c.first_name, c.last_name, c.city, s.start_time, s.end_time, s.hours_worked, s.salary
-            FROM shifts s
-            JOIN croupiers c ON s.croupier_tg_id = c.tg_id
-            WHERE c.city = ? AND s.status = 'closed'
-            ORDER BY s.start_time DESC
-            LIMIT ?
-        ''', (city, limit))
+async def get_shifts_for_manager(city: str = None, limit=50):
+    async with db_pool.acquire() as conn:
+        if city:
+            rows = await conn.fetch('''
+                SELECT s.id, c.first_name, c.last_name, c.city, s.start_time, s.end_time, s.hours_worked, s.salary
+                FROM shifts s
+                JOIN croupiers c ON s.croupier_tg_id = c.tg_id
+                WHERE c.city = $1 AND s.status = 'closed'
+                ORDER BY s.start_time DESC
+                LIMIT $2
+            ''', city, limit)
+        else:
+            rows = await conn.fetch('''
+                SELECT s.id, c.first_name, c.last_name, c.city, s.start_time, s.end_time, s.hours_worked, s.salary
+                FROM shifts s
+                JOIN croupiers c ON s.croupier_tg_id = c.tg_id
+                WHERE s.status = 'closed'
+                ORDER BY s.start_time DESC
+                LIMIT $1
+            ''', limit)
+        return rows
+
+# Новая функция расчёта зарплаты за текущий период (1–15 или 15–конец месяца)
+async def get_croupier_salary_current_period(tg_id: int):
+    now = now_local()
+    day = now.day
+    if day < 15:
+        period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     else:
-        cur.execute('''
-            SELECT s.id, c.first_name, c.last_name, c.city, s.start_time, s.end_time, s.hours_worked, s.salary
-            FROM shifts s
-            JOIN croupiers c ON s.croupier_tg_id = c.tg_id
-            WHERE s.status = 'closed'
-            ORDER BY s.start_time DESC
-            LIMIT ?
-        ''', (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+        period_start = now.replace(day=15, hour=0, minute=0, second=0, microsecond=0)
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval('''
+            SELECT COALESCE(SUM(salary), 0) FROM shifts
+            WHERE croupier_tg_id = $1 AND status = 'closed' AND start_time >= $2
+        ''', tg_id, period_start)
+        return total, period_start
 
-def get_croupier_salary_last_days(tg_id: int, days=7):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    since = (datetime.now() - timedelta(days=days)).isoformat()
-    cur.execute('''
-        SELECT SUM(salary) FROM shifts
-        WHERE croupier_tg_id = ? AND status = 'closed' AND start_time >= ?
-    ''', (tg_id, since))
-    total = cur.fetchone()[0]
-    conn.close()
-    return total if total else 0.0
+async def is_manager(tg_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchval("SELECT 1 FROM managers WHERE tg_id = $1", tg_id)
+        return row is not None
 
-def is_manager(tg_id: int) -> bool:
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM managers WHERE tg_id = ?", (tg_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
+async def get_manager_city(tg_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchval("SELECT city FROM managers WHERE tg_id = $1", tg_id)
+        return row
 
-def get_manager_city(tg_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT city FROM managers WHERE tg_id = ?", (tg_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def get_managers_by_city(city: str):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT tg_id FROM managers WHERE city = ?", (city,))
-    rows = cur.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+async def get_managers_by_city(city: str):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT tg_id FROM managers WHERE city = $1", city)
+        return [r["tg_id"] for r in rows]
 
 # ---------- Клавиатуры ----------
-def main_keyboard(is_admin=False):
+def main_keyboard():
     buttons = [
         [KeyboardButton(text="📋 Список крупье")],
         [KeyboardButton(text="✏️ Изменить данные крупье")],
@@ -227,13 +205,11 @@ def main_keyboard(is_admin=False):
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-# Клавиатура для админ-меню после ввода пароля
 admin_menu_kb = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="➕ Добавить крупье"), KeyboardButton(text="❌ Удалить крупье")],
     [KeyboardButton(text="🔙 Назад")]
 ], resize_keyboard=True)
 
-# Инлайн клавиатура для выбора крупье на удаление
 def get_croupiers_list_inline(croupiers_list):
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for c in croupiers_list:
@@ -255,8 +231,6 @@ class AdminStates(StatesGroup):
 # ---------- Хендлеры ----------
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    # Приветствие
     await message.answer(
         "Добро пожаловать, крупье! 👋\n\n"
         "Используй кнопки меню для работы:\n"
@@ -270,15 +244,15 @@ async def cmd_start(message: Message):
 
 @dp.message(F.text == "📋 Список крупье")
 async def list_croupiers(message: Message):
-    croupiers = get_all_croupiers()
+    croupiers = await get_all_croupiers()
     if not croupiers:
         await message.answer("Список крупье пуст.")
         return
-    text = "📋 *Список крупье:*\n\n"
+    text = "📋 Список крупье:\n\n"
     for c in croupiers:
         text += f"👤 {c['first_name']} {c['last_name']} (@{c['tg_username'] or 'нет'})\n"
         text += f"   🏙 {c['city']} | Уровень {c['level']} | 💵 {c['hourly_rate']}₽/час\n"
-        text += f"   🆔 TG ID: `{c['tg_id']}`\n\n"
+        text += f"   🆔 TG ID: {c['tg_id']}\n\n"
     await message.answer(text)
 
 @dp.message(F.text == "✏️ Изменить данные крупье")
@@ -310,7 +284,7 @@ async def add_first_name(message: Message, state: FSMContext):
 async def add_last_name(message: Message, state: FSMContext):
     await state.update_data(last_name=message.text)
     await state.set_state(AdminStates.adding_city)
-    await message.answer("Введите город (например: Москва, Сочи):")
+    await message.answer("Введите город (например: Москва, Барнаул):")
 
 @dp.message(AdminStates.adding_city)
 async def add_city(message: Message, state: FSMContext):
@@ -336,8 +310,7 @@ async def add_level(message: Message, state: FSMContext):
 async def add_tg_id(message: Message, state: FSMContext):
     try:
         tg_id = int(message.text)
-        # Проверим, не занят ли уже
-        if get_croupier(tg_id):
+        if await get_croupier(tg_id):
             await message.answer("Крупье с таким Telegram ID уже существует! Используйте другой ID или удалите старого.")
             return
         await state.update_data(tg_id=tg_id)
@@ -354,7 +327,7 @@ async def add_username(message: Message, state: FSMContext):
     elif username.startswith("@"):
         username = username[1:]
     data = await state.get_data()
-    success = add_croupier(
+    success = await add_croupier(
         tg_id=data['tg_id'],
         first_name=data['first_name'],
         last_name=data['last_name'],
@@ -371,7 +344,7 @@ async def add_username(message: Message, state: FSMContext):
 
 @dp.message(F.text == "❌ Удалить крупье")
 async def delete_croupier_list(message: Message):
-    croupiers = get_all_croupiers()
+    croupiers = await get_all_croupiers()
     if not croupiers:
         await message.answer("Нет зарегистрированных крупье.")
         return
@@ -380,7 +353,7 @@ async def delete_croupier_list(message: Message):
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_croupier_callback(callback: CallbackQuery):
     tg_id = int(callback.data.split("_")[1])
-    delete_croupier(tg_id)
+    await delete_croupier(tg_id)
     await callback.answer("Крупье удалён.")
     await callback.message.edit_text("✅ Крупье удалён. Можно закрыть окно.")
     await callback.message.answer("Продолжайте работу.", reply_markup=admin_menu_kb)
@@ -395,45 +368,42 @@ async def back_to_main(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Возврат в главное меню.", reply_markup=main_keyboard())
 
-# ---------- Смены ----------
 @dp.message(F.text == "⏱ Начать смену")
 async def begin_shift(message: Message):
     user_id = message.from_user.id
-    croupier = get_croupier(user_id)
+    croupier = await get_croupier(user_id)
     if not croupier:
         await message.answer("❌ Вы не зарегистрированы как крупье. Обратитесь к администратору.")
         return
-    active = get_active_shift(user_id)
+    active = await get_active_shift(user_id)
     if active:
         await message.answer("⚠️ У вас уже есть активная смена. Закройте её, прежде чем начать новую.")
         return
-    shift_id, start_time_str = start_shift(user_id)
-    # Уведомление менеджеров города
-    managers = get_managers_by_city(croupier['city'])
+    shift_id, start_time = await start_shift(user_id)
+    managers = await get_managers_by_city(croupier['city'])
     full_name = f"{croupier['first_name']} {croupier['last_name']}"
-    start_dt = datetime.fromisoformat(start_time_str)
-    start_fmt = start_dt.strftime("%d.%m.%Y %H:%M:%S")
+    start_fmt = start_time.strftime("%d.%m.%Y %H:%M:%S")
     for mgr_id in managers:
         try:
             await bot.send_message(mgr_id,
                                    f"🟢 Крупье {full_name} (@{croupier['tg_username'] or 'нет'})\n"
-                                   f"🏙 {croupier['city']} начал смену в {start_fmt}.")
+                                   f"🏙 {croupier['city']} начал смену в {start_fmt} (Барнаул).")
         except:
             pass
-    await message.answer(f"✅ Смена начата в {start_fmt}.\nНе забудьте закрыть смену по окончании работы.")
+    await message.answer(f"✅ Смена начата в {start_fmt} (Барнаул).\nНе забудьте закрыть смену по окончании работы.")
 
 @dp.message(F.text == "⏹ Закрыть смену")
 async def end_shift(message: Message):
     user_id = message.from_user.id
-    croupier = get_croupier(user_id)
+    croupier = await get_croupier(user_id)
     if not croupier:
         await message.answer("❌ Вы не зарегистрированы как крупье.")
         return
-    active = get_active_shift(user_id)
+    active = await get_active_shift(user_id)
     if not active:
         await message.answer("У вас нет активной смены. Начните смену командой 'Начать смену'.")
         return
-    result = close_shift(user_id, croupier['hourly_rate'])
+    result = await close_shift(user_id, croupier['hourly_rate'])
     if result is None:
         await message.answer("Ошибка закрытия смены.")
         return
@@ -447,58 +417,56 @@ async def end_shift(message: Message):
         f"🔒 Смена закрыта.\n"
         f"⏱ Время работы: {hours_rounded} ч.\n"
         f"💰 Заработано: {salary_rounded} ₽\n"
-        f"🕒 {start_fmt} → {end_fmt}"
+        f"🕒 {start_fmt} → {end_fmt} (Барнаул)"
     )
-    # Уведомление менеджеров
-    managers = get_managers_by_city(croupier['city'])
+    managers = await get_managers_by_city(croupier['city'])
     for mgr_id in managers:
         try:
             await bot.send_message(mgr_id,
                                    f"🔴 Крупье {full_name} (@{croupier['tg_username'] or 'нет'})\n"
                                    f"🏙 {croupier['city']} закрыл смену.\n"
                                    f"⏱ {hours_rounded} ч. | 💵 {salary_rounded} ₽\n"
-                                   f"{start_fmt} → {end_fmt}")
+                                   f"{start_fmt} → {end_fmt} (Барнаул)")
         except:
             pass
 
-# ---------- Расчет ЗП ----------
 @dp.message(F.text == "💰 Расчет ЗП")
 async def calculate_salary(message: Message):
     user_id = message.from_user.id
-    croupier = get_croupier(user_id)
+    croupier = await get_croupier(user_id)
     if not croupier:
         await message.answer("Вы не зарегистрированы как крупье. Данные о зарплате недоступны.")
         return
-    total = get_croupier_salary_last_days(user_id, days=7)
-    await message.answer(f"💰 Ваша зарплата за последние 7 дней: {total:.2f} ₽\n"
-                         f"(Учитываются только закрытые смены)")
+    total, period_start = await get_croupier_salary_current_period(user_id)
+    period_str = period_start.strftime("%d.%m.%Y")
+    await message.answer(f"💰 Ваша зарплата за период с {period_str} по сегодня: {total:.2f} ₽\n"
+                         f"(смены считаются по Барнаульскому времени)")
 
-# ---------- Таблица для админов ----------
 @dp.message(F.text == "📊 Таблица")
 async def show_table(message: Message):
     user_id = message.from_user.id
-    if not is_manager(user_id):
+    if not await is_manager(user_id):
         await message.answer("❌ Эта функция доступна только турнирным менеджерам.")
         return
-    city = get_manager_city(user_id)
-    shifts = get_shifts_for_manager(city=city)
+    city = await get_manager_city(user_id)
+    shifts = await get_shifts_for_manager(city=city)
     if not shifts:
         await message.answer("Нет закрытых смен для отображения.")
         return
-    text = "📊 *Таблица смен*\n\n"
+    text = "📊 Таблица смен\n\n"
     for s in shifts:
-        # s: id, first_name, last_name, city, start_time, end_time, hours_worked, salary
-        start_dt = datetime.fromisoformat(s[4]).strftime("%d.%m %H:%M")
-        end_dt = datetime.fromisoformat(s[5]).strftime("%d.%m %H:%M") if s[5] else "—"
-        hours = round(s[6], 2) if s[6] else 0
-        salary = round(s[7], 2) if s[7] else 0
-        text += f"👤 {s[1]} {s[2]} ({s[3]})\n"
+        start_dt = s["start_time"].strftime("%d.%m %H:%M")
+        end_dt = s["end_time"].strftime("%d.%m %H:%M") if s["end_time"] else "—"
+        hours = round(s["hours_worked"], 2) if s["hours_worked"] else 0
+        salary = round(s["salary"], 2) if s["salary"] else 0
+        text += f"👤 {s['first_name']} {s['last_name']} ({s['city']})\n"
         text += f"   🕒 {start_dt} → {end_dt}\n"
         text += f"   ⏱ {hours} ч. | 💵 {salary} ₽\n\n"
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 # ---------- Запуск ----------
 async def main():
+    await init_db()
     print("Бот запущен...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
