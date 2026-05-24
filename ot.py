@@ -279,7 +279,7 @@ async def list_croupiers(message: Message):
         text += f"👤 {c['first_name']} {c['last_name']} (@{c['tg_username'] or 'нет'})\n"
         text += f"   🏙 {c['city']} | Уровень {c['level']} | 💵 {c['hourly_rate']}₽/час\n"
         text += f"   🆔 TG ID: `{c['tg_id']}`\n\n"
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 @dp.message(F.text == "✏️ Изменить данные крупье")
 async def change_croupier_data(message: Message, state: FSMContext):
